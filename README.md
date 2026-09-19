@@ -1,16 +1,16 @@
 # opencode-free-model-first
 
 Try the free opencode models on non-trivial work before spending the paid
-main model. Each task gets up to **3 read-only free-model attempts**; if all
-three are trash, the main model does the task. Rotation is per attempt, so
-the next task starts on a different free model.
+main model. Each task gets up to **3 free-model attempts**; if all three are
+trash, the main model does the task. Rotation is per attempt, so the next task
+starts on a different free model.
 
 The chain is **free model -> main model**, which overrides the
 `claude-first` rule for these tasks.
 
 ## Variants
 
-Both variants share the same read-only `free-*` agents and the same pure-bash
+Both variants share the same `free-*` agents and the same pure-bash
 rotation script. Only the way a trial is invoked differs.
 
 | variant | how a trial runs | notes |
@@ -21,19 +21,20 @@ rotation script. Only the way a trial is invoked differs.
 ## How it works
 
 1. `lib/free_models.sh` picks the next free model from a rotation cursor.
-2. The trial runs in the variant's chosen way, against a read-only agent.
-3. The caller verifies the proposed answer/diff. Usable -> it is applied.
-   Trash -> recorded and the next model is tried. After 3 trash, the main
-   model handles it.
+2. The trial runs in the variant's chosen way, as a trial agent that may
+   read/edit/write files and run a limited command set.
+3. The caller verifies the ACTUAL workspace (tests/lint/build, `git diff`).
+   Usable -> kept. Trash -> its edits reverted and the next model is tried.
+   After 3 trash, the main model handles it.
 
-Read-only is enforced by the agent permissions (`edit: deny`, `task: deny`,
-bash limited to read-only commands), so a trial can inspect the codebase but
-never mutate it.
+The agents are not trusted: `edit`/`write` are allowed so they can finish real
+work, `task` is denied, and bash is a limited allowlist of read/dev commands.
+Verification and the revert belong to the caller.
 
 ## Contents
 
 ```
-agent/free-*.md                     one read-only agent per free model (shared)
+agent/free-*.md                     one trial agent per free model (shared)
 lib/free_models.sh                  rotation state (pure bash, shared)
 plugins/free-session-prefix.ts      tags trial sessions with a "[free] " prefix
 variants/task-tool/                 policy + skill for the built-in task tool
@@ -100,12 +101,17 @@ applies to sessions created in an already-running instance.
 
 ## Adding or removing a free model
 
-Add/delete an `agent/free-*.md` (pin `model:` and keep the read-only
-permission block). The script discovers the file automatically; no other
-change needed.
+Add/delete an `agent/free-*.md` (pin `model:` and keep the edit/write +
+limited-bash permission block). The script discovers the file automatically;
+no other change needed.
 
 ## Notes
 
+- **Cost discipline**: the free models cost nothing, but every step re-reads
+  the whole context. Measured trials used 1-3 steps, ~11k input per attempt,
+  ~11k cache-read per extra step, and negligible output — so step count is the
+  real driver. Agents cap at `steps: 20`, and the briefs ask for minimal reads
+  and no large dumps. If a task clearly needs heavy exploration, skip the trial.
 - `free-nemotron-ultra` and `free-nemotron-lightning` have been observed to
   time out; a timeout counts as trash and they rotate out after one attempt.
 - Runtime rotation state (`.cursor`, `stats.tsv`) is created in the installed
