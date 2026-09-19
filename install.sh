@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Install the free-model-first mechanism into the local opencode config.
 #
-#   ./install.sh                 # installs into ~/.config/opencode
-#   OPENCODE_CONFIG=/path ./install.sh
+#   ./install.sh                  # default variant: task-tool
+#   ./install.sh opencode-run     # subprocess variant
+#   OPENCODE_CONFIG=/path ./install.sh task-tool
 #
+# Variants share the agents and rotation script; only the policy and skill
+# differ. Installing one variant replaces the other (same destination paths).
 # Idempotent: re-running it will not duplicate anything.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VARIANT="${1:-task-tool}"
 DEST="${OPENCODE_CONFIG:-$HOME/.config/opencode}"
+VARIANT_DIR="$SRC/variants/$VARIANT"
 
+if [ ! -d "$VARIANT_DIR" ]; then
+  printf 'Unknown variant: %s\nAvailable: %s\n' "$VARIANT" "$(ls "$SRC/variants")" >&2
+  exit 1
+fi
 if [ ! -d "$DEST" ]; then
   printf 'opencode config dir not found: %s\n' "$DEST" >&2
   printf 'Set OPENCODE_CONFIG to override.\n' >&2
@@ -19,9 +28,9 @@ fi
 mkdir -p "$DEST/agent" "$DEST/instructions" "$DEST/skills/free-model-first"
 
 cp "$SRC"/agent/free-*.md "$DEST/agent/"
-cp "$SRC/instructions/free-model-first.md" "$DEST/instructions/"
-cp "$SRC/skills/free-model-first/SKILL.md" "$DEST/skills/free-model-first/"
-cp "$SRC/skills/free-model-first/free_models.sh" "$DEST/skills/free-model-first/"
+cp "$VARIANT_DIR/instructions/free-model-first.md" "$DEST/instructions/"
+cp "$VARIANT_DIR/skills/free-model-first/SKILL.md" "$DEST/skills/free-model-first/"
+cp "$SRC/lib/free_models.sh" "$DEST/skills/free-model-first/"
 chmod +x "$DEST/skills/free-model-first/free_models.sh"
 
 INSTR="$DEST/instructions/free-model-first.md"
@@ -68,4 +77,4 @@ EOF
   fi
 fi
 
-printf '\nInstalled. Restart opencode to load the new agents and instruction.\n'
+printf '\nInstalled variant "%s". Restart opencode to load the new agents and instruction.\n' "$VARIANT"

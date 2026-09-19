@@ -8,11 +8,20 @@ the next task starts on a different free model.
 The chain is **free model -> main model**, which overrides the
 `claude-first` rule for these tasks.
 
+## Variants
+
+Both variants share the same read-only `free-*` agents and the same pure-bash
+rotation script. Only the way a trial is invoked differs.
+
+| variant | how a trial runs | notes |
+| --- | --- | --- |
+| `task-tool` **(default)** | opencode's built-in task tool with `subagent_type: free-*` | stays inside the session; no extra process, no scratch files |
+| `opencode-run` | `opencode run --agent free-*` via bash | each trial is an isolated process; output is redirected to a scratch file |
+
 ## How it works
 
-1. A pure-bash script picks the next free model from a rotation cursor.
-2. The trial runs through the opencode binary in an isolated, read-only
-   agent: `opencode run --agent <free-*> --dir <workdir> --auto -- "<brief>"`.
+1. `lib/free_models.sh` picks the next free model from a rotation cursor.
+2. The trial runs in the variant's chosen way, against a read-only agent.
 3. The caller verifies the proposed answer/diff. Usable -> it is applied.
    Trash -> recorded and the next model is tried. After 3 trash, the main
    model handles it.
@@ -24,10 +33,10 @@ never mutate it.
 ## Contents
 
 ```
-agent/free-*.md                     one read-only agent per free model
-instructions/free-model-first.md    always-on policy
-skills/free-model-first/SKILL.md    full workflow
-skills/free-model-first/free_models.sh   rotation state (pure bash)
+agent/free-*.md                     one read-only agent per free model (shared)
+lib/free_models.sh                  rotation state (pure bash, shared)
+variants/task-tool/                 policy + skill for the built-in task tool
+variants/opencode-run/              policy + skill for the subprocess path
 install.sh / uninstall.sh
 ```
 
@@ -38,13 +47,15 @@ Free models covered: `big-pickle`, `ling-3.0-flash-fin-free`,
 ## Install
 
 ```bash
-./install.sh
+./install.sh              # task-tool (default)
+./install.sh opencode-run # subprocess variant
 ```
 
-Copies the agents, instruction and skill into `~/.config/opencode` (override
-with `OPENCODE_CONFIG=...`), adds the instruction to the `instructions` array
-of `opencode.jsonc`, and appends a marked precedence note to
-`claude-first.md`. Re-running is safe.
+Copies the agents, the variant's instruction and skill, and the rotation
+script into `~/.config/opencode` (override with `OPENCODE_CONFIG=...`), adds
+the instruction to the `instructions` array of `opencode.jsonc`, and appends a
+marked precedence note to `claude-first.md`. Re-running is safe, and
+installing one variant replaces the other.
 
 **Restart opencode** afterwards: config is loaded once at startup.
 
@@ -66,6 +77,8 @@ bash "$s" reset     # zero the cursor and counts
 Run a trial directly:
 
 ```bash
+# task-tool variant: call the task tool with subagent_type "free-mimo"
+# opencode-run variant:
 opencode run --agent free-mimo --dir "$PWD" --auto -- "<self-contained brief>"
 ```
 
