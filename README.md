@@ -6,6 +6,9 @@ philosophy: **warn, never block** — nothing throws, no tool is stopped, and th
 agent feels vanilla most of the time because warnings only surface when a point
 is actually worth making (backoff on repeats).
 
+This repo now also ships the two **budget** plugins (see below), so all three
+opencode efficiency plugins live here as the source of truth.
+
 ## What it does
 
 - **Repeated reads** — logs every `read` per session; re-reading the same file
@@ -38,20 +41,33 @@ them into the next system prompt** via `experimental.chat.system.transform`:
 
 `client.app.log` records every warning for audit regardless.
 
+## Budget plugins
+
+- **`budget-watch.ts`** — polls the provider balance and injects a
+  `# budget-watch-inject: budget` block when the balance or daily spend crosses
+  a threshold; exposes the `budget_status` tool.
+- **`budget-optimizer.ts`** — tracks *where* spend goes from opencode.db's real
+  per-step `cost`/`tokens`, warns before expensive reads/steps, and injects a
+  budget-mode block. Exposes the `budget_report` tool, which reports the day's
+  cost, token-class split, peak/off-peak, burn rate, top sessions, and **this
+  session's own cost + token breakdown**.
+
+Both read `~/.local/share/opencode/opencode.db` read-only and never block.
+
 ## Install
 
 ```bash
 bash install.sh
 ```
 
-Copies `plugin/token-optimization.ts` to `~/.config/opencode/plugins/` and
-ensures `@opencode-ai/plugin` is declared in `~/.config/opencode/package.json`.
+Copies every `plugin/*.ts` to `~/.config/opencode/plugins/` and ensures
+`@opencode-ai/plugin` is declared in `~/.config/opencode/package.json`.
 Plugins load at the next opencode session start. Re-running is idempotent.
 
 ## Uninstall
 
-Remove `~/.config/opencode/plugins/token-optimization.ts` (and optionally drop
-the `@opencode-ai/plugin` entry from `~/.config/opencode/package.json`).
+Remove the matching files under `~/.config/opencode/plugins/` (and optionally
+drop the `@opencode-ai/plugin` entry from `~/.config/opencode/package.json`).
 
 ## What's deliberately dropped
 
