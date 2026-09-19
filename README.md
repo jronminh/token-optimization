@@ -6,8 +6,8 @@ philosophy: **warn, never block** — nothing throws, no tool is stopped, and th
 agent feels vanilla most of the time because warnings only surface when a point
 is actually worth making (backoff on repeats).
 
-This repo now also ships the two **budget** plugins (see below), so all three
-opencode efficiency plugins live here as the source of truth.
+This repo now also ships the **budget** plugin (see below), so both opencode
+efficiency plugins live here as the source of truth.
 
 ## What it does
 
@@ -20,9 +20,22 @@ opencode efficiency plugins live here as the source of truth.
   injected into every turn, counting only *user-editable* content (the managed
   `opencode-code-termux-native` block is excluded, exactly like the Claude-side
   hook excludes the termux block from `~/.claude/CLAUDE.md`).
-- **Every-turn rules** — a terse rules block is injected into `output.system`
-  each turn via `experimental.chat.system.transform`, so the habits survive
-  compaction (the analog of appending `claude-md-snippet.md` to `CLAUDE.md`).
+- **Context monitor** — reads the session's REAL token usage from the latest
+  `step-finish` part (`bun:sqlite` on `opencode.db`, SDK fallback) every 15
+  tool calls, and warns when a checkpoint (100k…2M) is crossed, naming the
+  heaviest tools so far.
+- **Large-call flag** — flags a tool call abnormal for its own tool type
+  (>8x that tool's running session average); the `find-large-turns.sh` analog.
+- **Bash-output warning** — Bash is the biggest token source; a large `bash`
+  result gets a hard nudge to pipe through `head`/`grep`/`tail`.
+- **Every-turn rules** — a terse one-line rules reminder is injected into
+  `output.system` each turn via `experimental.chat.system.transform` (so the
+  habits survive compaction); the full block is injected once per session and
+  again after a compaction.
+- **Standardized markers + relay** — every injected block starts with
+  `# <name>-inject: <kind>`; `environment-snippet.md` (installed into
+  `environment.md`) tells the model to relay them to the user. TUI toasts are
+  implemented but off by default.
 
 ## How warnings reach the model
 
@@ -41,18 +54,18 @@ them into the next system prompt** via `experimental.chat.system.transform`:
 
 `client.app.log` records every warning for audit regardless.
 
-## Budget plugins
+## Budget plugin
 
-- **`budget-watch.ts`** — polls the provider balance and injects a
-  `# budget-watch-inject: budget` block when the balance or daily spend crosses
-  a threshold; exposes the `budget_status` tool.
-- **`budget-optimizer.ts`** — tracks *where* spend goes from opencode.db's real
-  per-step `cost`/`tokens`, warns before expensive reads/steps, and injects a
-  budget-mode block. Exposes the `budget_report` tool, which reports the day's
-  cost, token-class split, peak/off-peak, burn rate, top sessions, and **this
-  session's own cost + token breakdown**.
+- **`budget.ts`** — the merged balance-watch + budget-optimizer plugin. Polls
+  the provider balance and today's spend, prices each step from `opencode.db`'s
+  real per-step `cost`/`tokens`, warns on oversized reads / unbounded bash /
+  expensive steps, and injects one detailed `# budget-inject: budget` block on
+  a fixed step cadence (default every 15 chat steps). It also fires the
+  `# budget-inject: session-limit` per-chat spend guard. Exposes `budget_status`
+  (balance + today's spend) and `budget_report` (day's cost, token-class split,
+  peak/off-peak, burn rate, top sessions, and this session's own breakdown).
 
-Both read `~/.local/share/opencode/opencode.db` read-only and never block.
+Reads `~/.local/share/opencode/opencode.db` read-only and never blocks.
 
 ## Install
 
@@ -60,24 +73,26 @@ Both read `~/.local/share/opencode/opencode.db` read-only and never block.
 bash install.sh
 ```
 
-Copies every `plugin/*.ts` to `~/.config/opencode/plugins/` and ensures
-`@opencode-ai/plugin` is declared in `~/.config/opencode/package.json`.
-Plugins load at the next opencode session start. Re-running is idempotent.
+Copies every `plugin/*.ts` to `~/.config/opencode/plugins/`, ensures
+`@opencode-ai/plugin` is declared in `~/.config/opencode/package.json`, and
+appends `environment-snippet.md` (the relay instruction) to
+`~/.config/opencode/environment.md` between markers (replacing any previous
+copy). Plugins load at the next opencode session start. Re-running is
+idempotent.
 
 ## Uninstall
 
 Remove the matching files under `~/.config/opencode/plugins/` (and optionally
 drop the `@opencode-ai/plugin` entry from `~/.config/opencode/package.json`).
 
-## What's deliberately dropped
+## What's still not ported
 
-- **Context monitoring** (`context-monitor` / `check-context.sh` upstream):
-  that reads REAL per-message API token usage from the transcript. The opencode
-  SDK `Message` type has no per-message `usage` field, so there's no faithful
-  source — skipped rather than faked, same call the original repo made about
-  guessing the context window.
-- **`find-large-turns.sh` / baseline calibration**: no token-usage source to
-  drive "abnormal call" detection, for the same reason.
+- **Window / percentage guessing** — deliberately not done: the real context
+  window can't be derived from the transcript, so the monitor reports the exact
+  token count and the checkpoint only, never a percentage.
+- **`calibrate-baseline.sh`'s cross-session baseline** — the large-call flag
+  uses a running per-session average instead, so no external calibration file
+  is needed.
 
 ## License
 

@@ -11,6 +11,7 @@
 //   reread warn            check-reread.sh         tool.execute.before (read)
 //   md-size warn           check-md-size.sh        tool.execute.before (read/edit/write/apply_patch)
 //   context monitor        context-monitor-hook.sh tool.execute.after + session step-finish tokens
+//   large-call flag        find-large-turns.sh     tool.execute.after (running per-tool avg)
 //   every-turn rules       claude-md-snippet.md    experimental.chat.system.transform
 //
 // Two things added beyond the original port:
@@ -64,6 +65,11 @@ export const TokenOptimization: Plugin = async ({
   const DB_PATH = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"),
                        "opencode", "opencode.db")
 
+  // --- large-call detection (find-large-turns port) ---
+  const CALL_MIN_SAMPLES = 5    // need this many prior calls of a tool before flagging
+  const CALL_MULTIPLIER = 8     // flag a call > 8x that tool's running average
+  const BASH_OUTPUT_WARN = 6000 // est tokens; a bash result above this gets a nudge
+
   // --- debug reporting ---
   // Toasts are implemented but OFF by default (user request): the model
   // relays injected blocks to the user instead, keyed on INJECT_MARK below.
@@ -106,6 +112,8 @@ export const TokenOptimization: Plugin = async ({
   const rulesToastDone = new Set<string>()
   const rulesSeen = new Set<string>()      // full block already injected once
   const needsFullRules = new Set<string>() // set after a compaction
+  const toolStats = new Map<string, { sum: number; n: number }>() // running avg per tool
+  const largeCallHits = new Map<string, number>()                 // backoff counter
 
   const estTokens = (s: string) => Math.floor([...s].length / 3.5)
 
@@ -298,15 +306,59 @@ export const TokenOptimization: Plugin = async ({
     const cp = crossed[crossed.length - 1]
     try { mkdirSync(dir, { recursive: true }); writeFileSync(cpFile, String(cp)) } catch { /* best-effort */ }
 
-    const msg = `Context just crossed ${Math.round(cp / 1000)}k tokens - current ~${tokens} (input + cache_read). Real API usage; window size can't be derived from here.`
+    const top = [...toolStats.entries()]
+      .sort((a, b) => b[1].sum - a[1].sum)
+      .slice(0, 3)
+      .map(([t, s]) => `${t} ~${Math.round(s.sum)}`)
+      .join(", ")
+    const msg = `Context just crossed ${Math.round(cp / 1000)}k tokens - current ~${tokens} (input + cache_read). Heaviest tools so far (est tokens): ${top || "n/a"}. Real API usage; window size can't be derived from here.`
     queue(sessionID, "context", msg)
   }
 
+  // ---- large-call detection: flag a call abnormal for its own tool type ----
+  // The per-tool average is a running average for this session (no external
+  // calibration needed) - a Read and a Bash don't have the same normal size.
+  const maybeLargeCall = (sessionID: string, tool: string, args: unknown, output: any): void => {
+    let text = ""
+    try {
+      text = (typeof output?.output === "string" ? output.output : "") + JSON.stringify(args ?? {})
+    } catch { /* ignore */ }
+    const tokens = estTokens(text)
+
+    // Bash is the single biggest token source - hard nudge on a big result.
+    if (tool === "bash" && tokens >= BASH_OUTPUT_WARN) {
+      const key = `${sessionID}|bash`
+      const n = (largeCallHits.get(key) ?? 0) + 1
+      largeCallHits.set(key, n)
+      if (isPow2(n)) {
+        queue(sessionID, "bash-output",
+          `bash output ~${tokens} est tokens. Pipe through | head/grep/tail when only part is needed.`)
+      }
+    }
+
+    // Abnormal for its own tool type (needs a few prior samples first).
+    const st = toolStats.get(tool)
+    if (st && st.n >= CALL_MIN_SAMPLES) {
+      const avg = st.sum / st.n
+      if (tokens > avg * CALL_MULTIPLIER) {
+        const key = `${sessionID}|${tool}|abnormal`
+        const n = (largeCallHits.get(key) ?? 0) + 1
+        largeCallHits.set(key, n)
+        if (isPow2(n)) {
+          queue(sessionID, "large-call",
+            `${tool} call ~${tokens} est tokens (its avg ~${Math.round(avg)}, >${CALL_MULTIPLIER}x). Use a narrower command/read (grep, offset/limit).`)
+        }
+      }
+    }
+    toolStats.set(tool, { sum: (st?.sum ?? 0) + tokens, n: (st?.n ?? 0) + 1 })
+  }
+
   return {
-    "tool.execute.after": async (input) => {
+    "tool.execute.after": async (input, output) => {
       const sessionID = input.sessionID
       if (!sessionID) return
       try {
+        maybeLargeCall(sessionID, input.tool, input.args, output)
         await maybeContextCheckpoint(sessionID)
       } catch {
         /* never let the monitor break a tool call */

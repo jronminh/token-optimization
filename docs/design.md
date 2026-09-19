@@ -42,10 +42,26 @@ cap starts enforcing automatically.
 docs call this out explicitly. The plugin parses those marker lines so
 patch-based edits to the instructions file get the same cap.
 
-## Dropped features (honest, not hidden)
+## Context monitor — the faithful source found later
 
-- `context-monitor` / `check-context.sh`: read REAL per-message API `usage`
-  from the transcript; the opencode SDK `Message` has no per-message `usage`
-  field, so there's no faithful source. Skipped rather than faked.
-- `find-large-turns.sh` / per-tool baseline calibration: needs the same
-  token-usage source to detect abnormal calls, so it doesn't port either.
+The first port dropped context monitoring because the opencode SDK `Message`
+has no per-message `usage`. That's true, but the per-step **`step-finish`
+part** in `opencode.db` DOES carry real tokens (`input`/`output`/`cache`). The
+monitor reads the latest one for the session (via `bun:sqlite`, SDK fallback)
+every 15 tool calls and warns when a checkpoint is crossed. It still never
+reports a percentage or window — that genuinely can't be derived from the
+transcript (same conclusion as the Claude side).
+
+## Large-call detection
+
+`find-large-turns.sh` flags calls abnormal for their own tool type against a
+calibrated baseline. Rather than port the calibration file, the plugin keeps a
+**running per-session average** per tool and flags a call > 8x it (after a few
+samples), plus a hard Bash-output nudge since Bash is the biggest source.
+
+## Relay instruction
+
+Every injected block starts with `# <name>-inject: <kind>`. Because the
+plugins' TUI toasts are off, `environment-snippet.md` (appended to
+`environment.md` by `install.sh`) tells the model to relay those blocks to the
+user. The markers are standardized so the model recognizes them instantly.

@@ -38,6 +38,28 @@ else
 fi
 echo "Ensured @opencode-ai/plugin dependency in $PKG"
 
+# --- environment.md: append the relay instruction (idempotent, marker-based) ---
+# The plugins inject blocks into the model's context; this instruction tells the
+# model to relay them to the user (the plugins' own TUI toasts are off). Kept in
+# its own markers so re-running replaces it instead of duplicating.
+ENV_FILE="$CONFIG_DIR/environment.md"
+SNIPPET="$REPO_DIR/environment-snippet.md"
+if [ -f "$SNIPPET" ]; then
+  if [ -f "$ENV_FILE" ]; then
+    stripped=$(mktemp)
+    awk '
+      /<!-- opencode-token-optimization:begin -->/ { skip=1; next }
+      /<!-- opencode-token-optimization:end -->/   { skip=0; next }
+      !skip { print }
+    ' "$ENV_FILE" > "$stripped"
+    { printf '%s\n\n' "$(cat "$stripped")"; cat "$SNIPPET"; } > "$ENV_FILE"
+    rm -f "$stripped"
+  else
+    cp "$SNIPPET" "$ENV_FILE"
+  fi
+  echo "Installed relay instruction -> $ENV_FILE"
+fi
+
 cat <<'EOF'
 
 Install complete. The plugins load at the next opencode session start

@@ -1,37 +1,25 @@
-// Budget optimizer for opencode on Termux.
+// budget.ts - merged balance-watch + budget-optimizer plugin.
 //
-// Sibling to budget-watch.ts (which answers "how much is left?") and
-// token-optimization.ts (which warns on wasteful *token* patterns). This one
-// answers "where is the money actually going, and can I see the cost before
-// I spend it?".
+// One plugin that:
+//   - watches the provider balance and today's spend (was budget-watch)
+//   - prices each step from opencode.db, warns on oversized reads / unbounded
+//     bash / expensive steps, and exposes budget_report (was budget-optimizer)
+//   - injects a single detailed budget+token-usage block on a fixed step
+//     cadence (default every 15 chat steps) via
+//     `experimental.chat.system.transform`.
 //
-// It reuses the same design rules as the other two:
-//   - warn, never block: nothing throws, permits untouched.
-//   - quiet unless the point is worth making: per-key exponential backoff.
-//   - never guess numbers we can't measure: authoritative spend comes from the
-//     real per-step `cost`/`tokens` opencode writes into opencode.db; price
-//     math is only used for projections and pre-flight estimates, and is
-//     labelled as an estimate.
-//
-// DeepSeek price shape (per 1M tokens, deepseek-flash, off-peak):
-//   cache hit $0.003 | cache miss $0.15 | output $0.60
-// i.e. new content is 50x a cache hit, and output is 4x a cache miss. Peak
-// (01:00-04:00 and 06:00-10:00 UTC, Mon-Fri) doubles every rate. That is what
-// the levers below are ordered by.
-//
-// Injected blocks carry the marker `# budget-optimizer-inject: <kind>` and are
-// relayed by the model (see ~/.config/opencode/environment.md); every injection
-// is also logged to session-env/<session>/budget-optimizer.log.
-
+// Injected blocks start with `# budget-inject: <kind>` and are relayed by the
+// model (see ~/.config/opencode/environment.md). Every injection is logged to
+// session-env/<session>/budget.log.
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
-import { basename, join } from "node:path"
+import { join } from "node:path"
 
-const INJECT_MARK = "budget-optimizer-inject"
+const INJECT_MARK = "budget-inject"
 
-const CONFIG_FILE = join(homedir(), ".config", "opencode", "budget-optimizer.json")
+const CONFIG_FILE = join(homedir(), ".config", "opencode", "budget.json")
 const DATA_HOME = process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share")
 const AUTH_FILE = join(DATA_HOME, "opencode", "auth.json")
 const DB_PATH = join(DATA_HOME, "opencode", "opencode.db")
@@ -40,12 +28,21 @@ const SESSION_ENV = join(homedir(), ".config", "opencode", "session-env")
 const DEFAULTS = {
   provider: "deepseek",
   balanceUrl: "https://api.deepseek.com/user/balance",
+  // balance thresholds
+  warnAt: 5,
+  criticalAt: 2,
+  emptyAt: 0.5,
+  // spend thresholds
   dailySpendAt: 2,
   budgetModeAt: 3,
+  // per-chat (session) spend guard: caution line, then hard "start a new chat" line
+  sessionSpendAt: 0.5,
+  sessionSpendCriticalAt: 1,
   warnOpCost: 0.005,
   warnStepCost: 0.01,
   recheckMinutes: 5,
   reWarnMinutes: 30,
+  injectEverySteps: 15,
   peakWindowsUtc: [
     [1, 4],
     [6, 10],
@@ -87,7 +84,6 @@ const readApiKey = (provider: string): string | null => {
   }
 }
 
-// "deepseek-v4-flash" and "deepseek-flash" both bill at the flash rate.
 const priceKey = (modelID: string): string =>
   /pro/.test(modelID) ? "deepseek-v4-pro" : "deepseek-flash"
 
@@ -100,12 +96,12 @@ const isPeak = (tsMs: number, windows: [number, number][]): boolean => {
 }
 
 const fmtUsd = (n: number): string => `$${n.toFixed(n < 1 ? 4 : 2)}`
+const LABELS = ["OK", "LOW", "CRITICAL", "EMPTY"]
 
-export const BudgetOptimizer: Plugin = async ({ client }) => {
+export const Budget: Plugin = async () => {
   const cfg = loadConfig()
 
-  // bun:sqlite is the fast path inside opencode; node:sqlite is a fallback so
-  // the plugin can also be exercised from plain node (tests, one-off reports).
+  // ------------------------------------------------------------------ db
   let openDb: (() => any) | null = null
   try {
     const bun: any = await import("bun:sqlite")
@@ -131,11 +127,10 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
     }
   }
 
-  const dbGet = <T = any>(sql: string, params: any[] = []): T | null => {
-    const rows = dbAll<T>(sql, params)
-    return rows[0] ?? null
-  }
+  const dbGet = <T = any>(sql: string, params: any[] = []): T | null =>
+    dbAll<T>(sql, params)[0] ?? null
 
+  // ------------------------------------------------------- model & rates
   const sessionModelCache = new Map<string, string>()
   const modelOf = (sessionID: string | undefined): string => {
     if (!sessionID) return "deepseek-flash"
@@ -144,8 +139,7 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
     let id = "deepseek-flash"
     try {
       const row = dbGet<{ model: string }>("select model from session where id=? limit 1", [sessionID])
-      const parsed = JSON.parse(row?.model ?? "{}")
-      id = parsed?.id ?? id
+      id = JSON.parse(row?.model ?? "{}")?.id ?? id
     } catch {
       /* keep default */
     }
@@ -168,11 +162,10 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
 
   const localDate = (): string => {
     const d = new Date()
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-      d.getDate(),
-    ).padStart(2, "0")}`
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
   }
 
+  // ----------------------------------------------------------- today stats
   type Bucket = {
     sid: string
     hour: string
@@ -228,12 +221,9 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
       const peak = isPeak(ts, cfg.peakWindowsUtc)
       out.cost += b.cost
       out.steps += b.steps
-      const cr = b.cr * (rate.cacheHit / 1e6)
-      const cm = (b.i + b.cw) * (rate.cacheMiss / 1e6)
-      const op = (b.o + b.r) * (rate.output / 1e6)
-      out.classes.cacheHit += cr
-      out.classes.cacheMiss += cm
-      out.classes.output += op
+      out.classes.cacheHit += b.cr * (rate.cacheHit / 1e6)
+      out.classes.cacheMiss += (b.i + b.cw) * (rate.cacheMiss / 1e6)
+      out.classes.output += (b.o + b.r) * (rate.output / 1e6)
       if (peak) out.peakCost += b.cost
       else out.offPeakCost += b.cost
       if (first === null || ts < first) first = ts
@@ -250,7 +240,7 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
     return value
   }
 
-  // One session's lifetime cost + token classes (authoritative `session.cost`).
+  // -------------------------------------------------------- session stats
   type SessionStats = {
     id: string
     title: string | null
@@ -297,6 +287,36 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
     }
   }
 
+  const stepCountOf = (sid: string): number =>
+    num(
+      dbGet<{ n: number }>(
+        "select count(*) as n from part where session_id=? and json_extract(data,'$.type')='step-finish'",
+        [sid],
+      )?.n,
+    )
+
+  const latestStep = (sid: string): { cost: number; input: number; output: number; reasoning: number; cacheRead: number } | null => {
+    const row = dbGet<{ data: string }>(
+      "select data from part where session_id=? and json_extract(data,'$.type')='step-finish' order by time_created desc limit 1",
+      [sid],
+    )
+    if (!row?.data) return null
+    try {
+      const p = JSON.parse(row.data)
+      const t = p?.tokens ?? {}
+      return {
+        cost: num(p?.cost),
+        input: num(t.input),
+        output: num(t.output),
+        reasoning: num(t.reasoning),
+        cacheRead: num(t?.cache?.read),
+      }
+    } catch {
+      return null
+    }
+  }
+
+  // ------------------------------------------------------------ balance
   let balCache: { at: number; total: number; currency: string } | null = null
   let balInflight: Promise<void> | null = null
   const refreshBalance = (): Promise<void> => {
@@ -327,106 +347,140 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
     return balInflight
   }
 
-  const dbg = (sessionID: string | undefined, text: string): void => {
+  const levelOf = (b: number): number =>
+    b <= cfg.emptyAt ? 3 : b <= cfg.criticalAt ? 2 : b <= cfg.warnAt ? 1 : 0
+
+  // ---------------------------------------------------------- logging
+  const dbg = (sid: string | undefined, text: string): void => {
     try {
-      const dir = join(SESSION_ENV, sessionID || "global")
+      const dir = join(SESSION_ENV, sid || "global")
       mkdirSync(dir, { recursive: true })
-      appendFileSync(
-        join(dir, "budget-optimizer.log"),
-        `${new Date().toISOString()}\t${text.replace(/\s+/g, " ").trim()}\n`,
-      )
+      appendFileSync(join(dir, "budget.log"), `${new Date().toISOString()}\t${text.replace(/\s+/g, " ").trim()}\n`)
     } catch {
       /* best-effort */
     }
   }
 
-  const toast = async (message: string, variant: "info" | "warning" | "error"): Promise<void> => {
-    try {
-      await client.tui.showToast({ body: { title: "budget-optimizer", message, variant, duration: 8000 } })
-    } catch {
-      /* no TUI attached */
-    }
-  }
-
+  // ---------------------------------------------------------- warnings
   const pendingBySession = new Map<string, string[]>()
-  const warnCount = new Map<string, number>() // per session+key, for exponential backoff
+  const warnCount = new Map<string, number>()
   const lastWarnAt = new Map<string, number>()
 
   const shouldWarn = (key: string, cooldownMs: number): boolean => {
     const now = Date.now()
-    const last = lastWarnAt.get(key) ?? 0
-    if (now - last < cooldownMs) return false
+    if (now - (lastWarnAt.get(key) ?? 0) < cooldownMs) return false
     const n = (warnCount.get(key) ?? 0) + 1
     warnCount.set(key, n)
-    if ((n & (n - 1)) !== 0) return false // only on powers of two: 1,2,4,8...
+    if ((n & (n - 1)) !== 0) return false // powers of two only: 1,2,4,8...
     lastWarnAt.set(key, now)
     return true
   }
 
-  const queue = (sessionID: string | undefined, kind: string, text: string): void => {
+  const queue = (sid: string | undefined, text: string): void => {
     if (!text) return
-    const sid = sessionID || "global"
-    const arr = pendingBySession.get(sid) ?? []
+    const key = sid || "global"
+    const arr = pendingBySession.get(key) ?? []
     arr.push(text)
-    pendingBySession.set(sid, arr)
-    dbg(sessionID, `${kind}: ${text}`)
-    if (kind !== "rules") void toast(text, kind === "mode" ? "warning" : "info")
+    pendingBySession.set(key, arr)
+    dbg(sid, `warn: ${text}`)
   }
 
-  const opCost = (sessionID: string | undefined, tokens: number): number => {
-    const rate = rateFor(modelOf(sessionID), Date.now())
-    return (tokens * rate.cacheMiss) / 1e6
-  }
+  const opCost = (sid: string | undefined, tokens: number): number =>
+    (tokens * rateFor(modelOf(sid), Date.now()).cacheMiss) / 1e6
 
-  const cmdSig = (cmd: string): string => cmd.replace(/\s+/g, " ").trim().slice(0, 80)
+  const lastInjectStep = new Map<string, number>()
 
-  const UNBOUNDED =
-    /\b(cat|tac|find|tree|du|dmesg|journalctl|env|printenv|strings|xxd|hexdump|base64|tar|unzip|ls)\b/
-  const LIMITER = /\|\s*(head|tail|grep|rg|wc|sort|uniq|awk|sed|less|more)\b|>\s*\S|2>&1\s*>/
+  // ------------------------------------------------- session spend guard
+  // Escalating, per-chat caution: a long chat re-sends its whole history every
+  // step, so its cost grows super-linearly. Warn hard once a chat crosses the
+  // caution line and again at the critical line, recommending a fresh chat.
+  const sessionSpendTier = new Map<string, number>()
+  const sessionSpendWarnedAt = new Map<string, number>()
 
-  const latestStep = (
-    sessionID: string,
-  ): { cost: number; input: number; output: number; reasoning: number; cacheRead: number } | null => {
-    const row = dbGet<{ data: string }>(
-      "select data from part where session_id=? and json_extract(data,'$.type')='step-finish' order by time_created desc limit 1",
-      [sessionID],
-    )
-    if (!row?.data) return null
-    try {
-      const p = JSON.parse(row.data)
-      const t = p?.tokens ?? {}
-      return {
-        cost: num(p?.cost),
-        input: num(t.input),
-        output: num(t.output),
-        reasoning: num(t.reasoning),
-        cacheRead: num(t?.cache?.read),
-      }
-    } catch {
-      return null
+  const sessionLimitText = (cur: SessionStats, tier: number): string => {
+    if (tier <= 0) {
+      return [
+        `# ${INJECT_MARK}: session-limit`,
+        `CAUTION: this chat has spent ${fmtUsd(cur.cost)} across ${cur.steps} steps - over the ${fmtUsd(cfg.sessionSpendAt)} caution line.`,
+        `A long chat re-sends its entire history on every step, so each turn costs more than the last.`,
+        `Finish the current thought soon, then start a NEW chat for the next task instead of continuing here.`,
+        "Relay this caution to the user.",
+      ].join("\n")
     }
-  }
-
-  const budgetModeText = (s: Stats): string => {
-    const bal = balCache ? `, balance $${balCache.total.toFixed(2)}` : ""
     return [
-      `# ${INJECT_MARK}: mode`,
-      `BUDGET MODE - spent ~$${s.cost.toFixed(2)} today (${s.steps} steps)${bal}.`,
-      `deepseek-flash /1M off-peak: cache-hit $0.003, cache-miss $0.15, output $0.60 (peak doubles).`,
-      `Order of leverage: (1) trim tool output - it is new cache-miss input; (2) shorter replies / lower reasoning - output is 4x a cache miss; (3) keep the prefix stable so context stays cache-hit; (4) push heavy work to off-peak (peak = 01-04 & 06-10 UTC Mon-Fri).`,
-      `Relay this to the user and prefer the cheaper pattern for the rest of the task.`,
+      `# ${INJECT_MARK}: session-limit`,
+      `STOP AND START A NEW CHAT: this chat has spent ${fmtUsd(cur.cost)} across ${cur.steps} steps - over the ${fmtUsd(cfg.sessionSpendCriticalAt)} hard line.`,
+      `Every further step re-bills this whole history; continuing here is the most expensive way to work.`,
+      `Open a new chat and paste only what is needed for the next task. Do not keep working in this one.`,
+      "Relay this warning to the user and tell them plainly to start a new chat.",
     ].join("\n")
   }
 
-  const modeSeen = new Set<string>()
-  const lastModeAt = new Map<string, number>()
+  const sessionLimitWarning = (sid: string | null): string | null => {
+    if (!sid) return null
+    let cur: SessionStats | null = null
+    try {
+      cur = sessionStats(sid)
+    } catch {
+      return null
+    }
+    if (!cur) return null
+    const tier = cur.cost >= cfg.sessionSpendCriticalAt ? 1 : cur.cost >= cfg.sessionSpendAt ? 0 : -1
+    if (tier < 0) return null
+    const warned = sessionSpendTier.get(sid) ?? -1
+    const now = Date.now()
+    const last = sessionSpendWarnedAt.get(sid) ?? 0
+    // escalate immediately when a new tier is crossed, else respect the cooldown
+    if (tier <= warned && now - last < cfg.reWarnMinutes * 60_000) return null
+    sessionSpendTier.set(sid, Math.max(warned, tier))
+    sessionSpendWarnedAt.set(sid, now)
+    return sessionLimitText(cur, tier)
+  }
+
+  // ---------------------------------------------------------- injection
+  const buildBudgetText = (s: Stats, sid: string | null): string => {
+    const cls = s.classes
+    const clsTotal = cls.cacheHit + cls.cacheMiss + cls.output || 1
+    const pct = (v: number) => `${Math.round((v / clsTotal) * 100)}%`
+    const burn = s.steps > 0 && s.hoursElapsed > 0 ? s.cost / s.hoursElapsed : 0
+    const lines = [`# ${INJECT_MARK}: budget`]
+    if (balCache) {
+      const lvl = levelOf(balCache.total)
+      lines.push(
+        `${cfg.provider} balance: $${balCache.total.toFixed(2)} ${balCache.currency} - ${LABELS[lvl]}. ` +
+          `Thresholds: warn < $${cfg.warnAt}, critical < $${cfg.criticalAt}, empty < $${cfg.emptyAt}; daily spend warning at $${cfg.dailySpendAt}.`,
+      )
+    } else {
+      lines.push("Balance: unavailable.")
+    }
+    lines.push(
+      `Today: ${fmtUsd(s.cost)} across ${s.steps} steps (now ${isPeak(Date.now(), cfg.peakWindowsUtc) ? "PEAK" : "off-peak"}); ` +
+        `peak ${fmtUsd(s.peakCost)} / off-peak ${fmtUsd(s.offPeakCost)}; burn ${fmtUsd(burn)}/h, projected full day ~${fmtUsd(burn * 24)}.`,
+    )
+    lines.push(
+      `Token split (est): cache-miss ${fmtUsd(cls.cacheMiss)} (${pct(cls.cacheMiss)}), ` +
+        `cache-hit ${fmtUsd(cls.cacheHit)} (${pct(cls.cacheHit)}), output ${fmtUsd(cls.output)} (${pct(cls.output)}).`,
+    )
+    if (sid) {
+      const cur = sessionStats(sid)
+      if (cur) {
+        lines.push(
+          `This session: ${fmtUsd(cur.cost)} across ${cur.steps} steps. tokens: cache-miss in ${cur.input}, ` +
+            `cache-write ${cur.cacheWrite}, output ${cur.output}, reasoning ${cur.reasoning}, cache-read ${cur.cacheRead}.`,
+        )
+      }
+    }
+    lines.push(
+      "Levers: trim tool output (cache-miss), shorten output/reasoning (4x cache-miss), keep prefix stable (cache-hit), shift heavy work off-peak.",
+    )
+    lines.push("Relay this to the user.")
+    return lines.join("\n")
+  }
 
   return {
     "chat.params": async (input) => {
       const m: any = (input as any)?.model
-      if (input.sessionID && m?.id) {
-        sessionModelCache.set(input.sessionID, String(m.id))
-      }
+      if (input.sessionID && m?.id) sessionModelCache.set(input.sessionID, String(m.id))
     },
 
     "tool.execute.before": async (input, output) => {
@@ -450,7 +504,6 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
         if (!shouldWarn(`${sid}|read|${file}`, cfg.reWarnMinutes * 60_000)) return
         queue(
           sid,
-          "warn",
           `'${file}' is ~${Math.round(tokens / 1000)}k tokens -> ~${fmtUsd(cost)} as new (cache-miss) context. Prefer grep -n / read offset+limit over a full read.`,
         )
         return
@@ -459,12 +512,13 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
       if (input.tool === "bash") {
         const cmd = typeof args?.command === "string" ? args.command : ""
         if (!cmd) return
+        const UNBOUNDED = /\b(cat|tac|find|tree|du|dmesg|journalctl|env|printenv|strings|xxd|hexdump|base64|tar|unzip|ls)\b/
+        const LIMITER = /\|\s*(head|tail|grep|rg|wc|sort|uniq|awk|sed|less|more)\b|>\s*\S|2>&1\s*>/
         if (!UNBOUNDED.test(cmd) || LIMITER.test(cmd)) return
-        const sig = cmdSig(cmd)
+        const sig = cmd.replace(/\s+/g, " ").trim().slice(0, 80)
         if (!shouldWarn(`${sid}|bash|${sig}`, cfg.reWarnMinutes * 60_000)) return
         queue(
           sid,
-          "warn",
           `\`${sig}\` may print unbounded output - it lands in context as cache-miss input and is re-sent every later step. Pipe through head/grep/wc, add -n/-m limits, or redirect to a file and grep it.`,
         )
         return
@@ -474,8 +528,7 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
         if (!shouldWarn(`${sid}|task`, 0)) return
         queue(
           sid,
-          "warn",
-          `Spawning a subagent builds its own full context and pays its own step costs (often the priciest tool in a session). Keep the subagent's scope tight, or do the work inline when it is small.`,
+          "Spawning a subagent builds its own full context and pays its own step costs (often the priciest tool in a session). Keep the subagent's scope tight, or do the work inline when it is small.",
         )
       }
     },
@@ -490,7 +543,6 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
           const rate = rateFor(modelOf(sid), Date.now())
           queue(
             sid,
-            "warn",
             `Last step cost ${fmtUsd(step.cost)} (in ${step.input}, out ${step.output}, reasoning ${step.reasoning}, cache-read ${step.cacheRead}; output @ ${fmtUsd(rate.output)}/1M). Output + reasoning is the priciest class - trim verbosity/reasoning before trimming context.`,
           )
         }
@@ -500,22 +552,61 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
     },
 
     "experimental.chat.system.transform": async (input, output) => {
-      const sid = input.sessionID
-      await refreshBalance()
-      const s = stats()
-      const lowBal = !!balCache && balCache.total <= 5
-      if (s.cost < cfg.budgetModeAt && !lowBal) return
-      const now = Date.now()
-      const stale = now - (lastModeAt.get(sid || "global") ?? 0) > cfg.reWarnMinutes * 60_000
-      if (modeSeen.has(sid || "global") && !stale) return
-      modeSeen.add(sid || "global")
-      lastModeAt.set(sid || "global", now)
-      const text = budgetModeText(s)
-      output.system.push(text)
-      dbg(sid, `mode injected:\n${text}`)
+      const sid = input.sessionID ?? null
+      const key = sid || "global"
+
+      // Session spend guard fires immediately (not gated by the step cadence).
+      try {
+        const limit = sessionLimitWarning(sid)
+        if (limit) {
+          output.system.push(limit)
+          dbg(sid, `session-limit injected: ${limit.replace(/\s+/g, " ").trim()}`)
+        }
+      } catch {
+        /* never let the guard break a turn */
+      }
+
+      // Fixed step cadence (default every 15 chat steps).
+      const steps = sid ? stepCountOf(sid) : 0
+      if (steps - (lastInjectStep.get(key) ?? 0) < cfg.injectEverySteps) return
+      lastInjectStep.set(key, steps)
+
+      try {
+        await refreshBalance()
+        const text = buildBudgetText(stats(), sid)
+        output.system.push(text)
+        dbg(sid, `budget injected at step ${steps}:\n${text}`)
+      } catch {
+        /* never let the plugin break a turn */
+      }
+
+      const list = pendingBySession.get(key) ?? []
+      if (list.length > 0) {
+        output.system.push(`# ${INJECT_MARK}: warnings\n` + list.map((w) => `- ${w}`).join("\n"))
+        dbg(sid, `warnings injected: ${list.length}`)
+        list.length = 0
+      }
     },
 
     tool: {
+      budget_status: tool({
+        description:
+          "Check the configured LLM provider account balance, today's estimated spend, and the budget warning thresholds.",
+        args: {},
+        async execute() {
+          await refreshBalance()
+          const s = stats()
+          const bal = balCache
+            ? `$${balCache.total.toFixed(2)} ${balCache.currency} - ${LABELS[levelOf(balCache.total)]}`
+            : "unavailable"
+          return (
+            `${cfg.provider} balance: ${bal}. ` +
+            `Spent today: ~${fmtUsd(s.cost)} across ${s.steps} steps. ` +
+            `Thresholds: warn <$${cfg.warnAt}, critical <$${cfg.criticalAt}, empty <$${cfg.emptyAt}; daily spend warning at $${cfg.dailySpendAt}.`
+          )
+        },
+      }),
+
       budget_report: tool({
         description:
           "Report real LLM spend from opencode.db: today's authoritative cost, estimated split by token class (cache-hit / cache-miss / output), peak vs off-peak, burn rate, projected full day, top sessions, and this session's own cost + token breakdown.",
@@ -527,13 +618,12 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
           const clsTotal = cls.cacheHit + cls.cacheMiss + cls.output || 1
           const pct = (v: number) => `${Math.round((v / clsTotal) * 100)}%`
           const burn = s.steps > 0 && s.hoursElapsed > 0 ? s.cost / s.hoursElapsed : 0
-          const projected = burn * 24
           const lines = [
             `Today (${localDate()}): ${fmtUsd(s.cost)} across ${s.steps} steps.`,
-            balCache ? `Balance: $${balCache.total.toFixed(2)} ${balCache.currency}.` : `Balance: unavailable.`,
+            balCache ? `Balance: $${balCache.total.toFixed(2)} ${balCache.currency}.` : "Balance: unavailable.",
             `Split (est): cache-miss ${fmtUsd(cls.cacheMiss)} (${pct(cls.cacheMiss)}), cache-hit ${fmtUsd(cls.cacheHit)} (${pct(cls.cacheHit)}), output ${fmtUsd(cls.output)} (${pct(cls.output)}).`,
             `Peak ${fmtUsd(s.peakCost)} / off-peak ${fmtUsd(s.offPeakCost)} (now: ${isPeak(Date.now(), cfg.peakWindowsUtc) ? "PEAK" : "off-peak"}).`,
-            `Burn: ${fmtUsd(burn)}/h over ${s.hoursElapsed.toFixed(1)}h active; projected full day ~${fmtUsd(projected)}.`,
+            `Burn: ${fmtUsd(burn)}/h over ${s.hoursElapsed.toFixed(1)}h active; projected full day ~${fmtUsd(burn * 24)}.`,
           ]
           const sid = typeof ctx?.sessionID === "string" ? ctx.sessionID : null
           if (sid) {
@@ -569,7 +659,7 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
             )
           }
           lines.push(
-            `Levers: trim tool output (cache-miss), shorten output/reasoning (4x cache-miss), keep prefix stable (cache-hit), shift heavy work off-peak.`,
+            "Levers: trim tool output (cache-miss), shorten output/reasoning (4x cache-miss), keep prefix stable (cache-hit), shift heavy work off-peak.",
           )
           return lines.join("\n")
         },
@@ -578,4 +668,4 @@ export const BudgetOptimizer: Plugin = async ({ client }) => {
   }
 }
 
-export default BudgetOptimizer
+export default Budget
