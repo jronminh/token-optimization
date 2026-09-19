@@ -35,6 +35,7 @@ never mutate it.
 ```
 agent/free-*.md                     one read-only agent per free model (shared)
 lib/free_models.sh                  rotation state (pure bash, shared)
+plugins/free-session-prefix.ts      tags trial sessions with a "[free] " prefix
 variants/task-tool/                 policy + skill for the built-in task tool
 variants/opencode-run/              policy + skill for the subprocess path
 install.sh / uninstall.sh
@@ -81,6 +82,21 @@ Run a trial directly:
 # opencode-run variant:
 opencode run --agent free-mimo --dir "$PWD" --auto -- "<self-contained brief>"
 ```
+
+## Session history
+
+`plugins/free-session-prefix.ts` retitles every trial session with a `[free] `
+prefix, so the sessions spawned by the policy can be filtered out of session
+history. It matches any session whose agent starts with `free-` (both the
+task-tool subagents and `opencode run --agent free-*`), and re-applies the
+prefix if opencode's title generator later rewrites the title. It is cosmetic
+only — failures are swallowed.
+
+The built-in task tool already appends `(@<agent> subagent)` to child session
+titles, so `(@free-` also works as a filter even without the plugin.
+
+Plugins load at opencode startup, so a restart is required before the prefix
+applies to sessions created in an already-running instance.
 
 ## Adding or removing a free model
 

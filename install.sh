@@ -25,12 +25,13 @@ if [ ! -d "$DEST" ]; then
   exit 1
 fi
 
-mkdir -p "$DEST/agent" "$DEST/instructions" "$DEST/skills/free-model-first"
+mkdir -p "$DEST/agent" "$DEST/instructions" "$DEST/skills/free-model-first" "$DEST/plugins"
 
 cp "$SRC"/agent/free-*.md "$DEST/agent/"
 cp "$VARIANT_DIR/instructions/free-model-first.md" "$DEST/instructions/"
 cp "$VARIANT_DIR/skills/free-model-first/SKILL.md" "$DEST/skills/free-model-first/"
 cp "$SRC/lib/free_models.sh" "$DEST/skills/free-model-first/"
+cp "$SRC/plugins/free-session-prefix.ts" "$DEST/plugins/"
 chmod +x "$DEST/skills/free-model-first/free_models.sh"
 
 INSTR="$DEST/instructions/free-model-first.md"

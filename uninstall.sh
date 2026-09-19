@@ -10,6 +10,7 @@ DEST="${OPENCODE_CONFIG:-$HOME/.config/opencode}"
 rm -f "$DEST"/agent/free-*.md
 rm -rf "$DEST/skills/free-model-first"
 rm -f "$DEST/instructions/free-model-first.md"
+rm -f "$DEST/plugins/free-session-prefix.ts"
 
 for CFG in "$DEST/opencode.jsonc" "$DEST/opencode.json"; do
   if [ -f "$CFG" ]; then
