@@ -1,15 +1,21 @@
 // daily-limit.ts - a HARD daily spend cap for opencode.
 //
-// budget.ts only warns; this plugin blocks. When the money spent today
+// budget.ts only warns; this plugin blocks. Once the money spent today
 // (summed from the step-finish rows in opencode.db, same source budget.ts
-// uses) reaches `dailyLimit`, every tool call throws, so the agent can make
-// no further progress. The model call that requested the tool is already
-// paid for, so the stop is not to the cent - but it is a hard stop.
+// uses) reaches `dailyLimit`, every LLM request whose model is NOT free is
+// refused, so no further paid tokens are spent. FREE models/agents are always
+// allowed: hitting the cap stops the paid main model, not the free path.
 //
-// Config lives in ~/.config/opencode/budget.json:
+// Why not block all tools: blocking `task` would also kill delegation to the
+// free-* agents, which cost $0 and are exactly what you want after the cap.
+// The cap is about paid spend, so the gate keys on the model's cost, not on
+// the tool. (A paid main agent still cannot orchestrate for free - its own
+// turns are paid requests - so the free path means switching the main model
+// to a free one, or running a free agent.)
+//
+// Config in ~/.config/opencode/budget.json:
 //   { "dailyLimit": 2 }      // USD; 0 or absent disables the cap
-// The file is re-read (with a short cache) so the limit can be raised from
-// an editor without restarting opencode.
+// Re-read with a short cache, so the limit can be raised from an editor.
 import type { Plugin } from "@opencode-ai/plugin"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
@@ -35,6 +41,14 @@ const midnight = (): number => {
   return d.getTime()
 }
 
+// A model is free when both input and output cost 0. Unknown cost -> treat as
+// free (fail open: never lock the user out on missing data).
+const isFreeModel = (model: any): boolean => {
+  const c = model?.cost
+  if (!c) return true
+  return Number(c.input ?? 0) === 0 && Number(c.output ?? 0) === 0
+}
+
 export const DailyLimit: Plugin = async ({ client }) => {
   let openDb: (() => any) | null = null
   try {
@@ -49,62 +63,76 @@ export const DailyLimit: Plugin = async ({ client }) => {
     }
   }
 
-  const spentToday = (): number => {
-    if (!openDb) return 0
+  const q = <T = any>(sql: string, params: any[] = []): T | null => {
+    if (!openDb) return null
     try {
       const db = openDb()
-      const row = db
-        .prepare(
-          `select sum(json_extract(data,'$.cost')) c from part
-           where json_extract(data,'$.type')='step-finish' and time_created >= ?`,
-        )
-        .get(midnight())
+      const row = db.prepare(sql).get(...params)
       db.close()
-      return Number(row?.c ?? 0)
+      return (row as T) ?? null
     } catch {
-      return 0
+      return null
     }
   }
 
+  const spentToday = (): number =>
+    Number(q<any>(`select sum(json_extract(data,'$.cost')) c from part
+        where json_extract(data,'$.type')='step-finish' and time_created >= ?`, [midnight()])?.c ?? 0)
+
+  // chat.params is the only hook that sees the model's real cost, so it records
+  // which sessions are running a free model; the tool hook consults this set.
+  const freeSessions = new Set<string>()
+
   let cache: { at: number; limit: number; spent: number } | null = null
-  const spent = (): number => {
-    if (cache && Date.now() - cache.at < RECHECK_MS) return cache.spent
+  const snapshot = (): { limit: number; spent: number } => {
+    if (cache && Date.now() - cache.at < RECHECK_MS) return cache
     const limit = readLimit()
-    const s = limit > 0 ? spentToday() : 0
-    cache = { at: Date.now(), limit, spent: s }
-    return s
+    cache = { at: Date.now(), limit, spent: limit > 0 ? spentToday() : 0 }
+    return cache
   }
 
-  const breach = (): number | null => {
-    const limit = cache?.limit ?? readLimit()
-    if (!(limit > 0)) return null
-    const s = spent()
-    return s >= limit ? s : null
+  const breach = (): { spent: number; limit: number } | null => {
+    const s = snapshot()
+    return s.limit > 0 && s.spent >= s.limit ? { spent: s.spent, limit: s.limit } : null
   }
 
-  const block = (s: number, limit: number): Error =>
+  const block = (b: { spent: number; limit: number }): Error =>
     new Error(
-      `DAILY LIMIT HARD-BLOCK: $${s.toFixed(2)} spent today >= dailyLimit $${limit.toFixed(2)} ` +
-        `(budget.json). No further tool calls are allowed. Raise dailyLimit or resume tomorrow.`,
+      `DAILY LIMIT HARD-BLOCK: $${b.spent.toFixed(2)} spent today >= dailyLimit $${b.limit.toFixed(2)} ` +
+        `(budget.json). Paid models are refused; free models/agents still run. ` +
+        `Raise dailyLimit, switch to a free model, or resume tomorrow.`,
     )
 
+  await client.app.log({
+    body: { service: "daily-limit", level: "info", message: `active, dailyLimit=$${snapshot().limit}` },
+  })
+
   return {
-    "chat.params": async () => {
-      const s = breach()
-      if (s !== null) throw block(s, cache!.limit)
+    "chat.params": async (input) => {
+      if (isFreeModel(input.model)) {
+        freeSessions.add(input.sessionID)
+        return
+      }
+      freeSessions.delete(input.sessionID)
+      const b = breach()
+      if (b) throw block(b)
     },
-    "tool.execute.before": async (input) => {
-      const s = breach()
-      if (s === null) return
+    "tool.execute.before": async (input, output) => {
+      const b = breach()
+      if (!b) return
+      // delegating to a free agent is always allowed
+      if (input.tool === "task" && String(output?.args?.subagent_type ?? "").startsWith("free-")) return
+      // a session that chat.params saw running a free model is allowed everything
+      if (freeSessions.has(input.sessionID)) return
       await client.app.log({
         body: {
           service: "daily-limit",
           level: "warn",
-          message: "hard-blocked a tool call over the daily limit",
-          extra: { tool: input.tool, spent: s, limit: cache!.limit },
+          message: "hard-blocked a paid session tool call over the daily limit",
+          extra: { tool: input.tool, spent: b.spent, limit: b.limit },
         },
       })
-      throw block(s, cache!.limit)
+      throw block(b)
     },
   }
 }
