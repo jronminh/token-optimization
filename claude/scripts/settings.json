@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "# check-md-size: warn if CLAUDE.md user content exceeds token threshold\nbash ~/.claude/scripts/check-md-size.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "# check-reread: warn (don't block) if this file was already Read this session\nbash ~/.claude/scripts/check-reread.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "# check-md-size: warn (don't block) if a .md file being read crosses the token threshold\nbash ~/.claude/scripts/check-md-size.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "# context-monitor: periodic automatic context-usage check (every 15 tool calls)\nbash ~/.claude/scripts/context-monitor-hook.sh",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}
