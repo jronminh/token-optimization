@@ -5,5 +5,5 @@
   "dailySpendAt": 1,
   "sessionSpendAt": 0.4,
   "sessionSpendCriticalAt": 0.8,
-  "dailyLimit": 2
+  "dailyLimit": 1
 }
