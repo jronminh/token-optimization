@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Cheap model for auxiliary work (session titles, short summaries). Point it
+  // at a free opencode model so those never touch the paid DeepSeek balance.
+  "small_model": "opencode/ling-3.0-flash-fin-free",
+
+  "provider": {
+    "deepseek": {
+      "models": {
+        "deepseek-v4-flash": {
+          // Default reasoning effort: low | high | max ("none" disables).
+          // Reasoning tokens are billed as output, so lower = cheaper.
+          // Bump to high/max per task via the variant_cycle keybind.
+          "options": { "reasoningEffort": "low" }
+        }
+      }
+    }
+  },
+
+  "agent": {
+    "build": {
+      // Maximum agentic iterations before the agent is forced to answer
+      // text-only. Caps runaway cost; raise or drop it for long tasks.
+      "steps": 60
+    }
+  }
+}

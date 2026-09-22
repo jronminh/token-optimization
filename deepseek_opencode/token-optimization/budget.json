@@ -1,0 +1,8 @@
+{
+  "warnAt": 8,
+  "criticalAt": 3,
+  "emptyAt": 1,
+  "dailySpendAt": 1,
+  "sessionSpendAt": 0.4,
+  "sessionSpendCriticalAt": 0.8
+}
